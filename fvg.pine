@@ -1,0 +1,284 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TraderAmwayi
+
+//@version=6
+indicator("Fair Value Gap (FVG) Detector", "FVG", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   INPUT SETTINGS
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// --- Detection Settings ---
+bullish_enabled = input.bool(true, "Enable Bullish FVG", group="Detection Settings")
+bearish_enabled = input.bool(true, "Enable Bearish FVG", group="Detection Settings")
+max_fvgs = input.int(5000000,title = "Maximum FVGs to Display", minval=1, group="Detection Settings")
+historical_bars = input.int(5000000, "Historical Bars to Scan", minval=10, group="Detection Settings")
+
+// Multi-timeframe functionality temporarily disabled for stability
+
+// --- Display Settings ---
+keep_filled = input.bool(false, "Keep Filled FVGs Visible", group="Display Settings")
+show_labels = input.bool(true, "Show FVG Size Labels", group="Display Settings")
+label_format = input.string("Percentage", "Label Format", options=["Percentage", "Pips", "Points"], group="Display Settings")
+
+// --- Bullish FVG Styling ---
+bull_color = input.color(color.new(color.green, 80), "Bullish FVG Color", group="Bullish FVG Style")
+bull_border_color = input.color(color.green, "Bullish Border Color", group="Bullish FVG Style")
+bull_border_style = input.string("Solid", "Bullish Border Style", options=["Solid", "Dashed", "Dotted"], group="Bullish FVG Style")
+
+// --- Bearish FVG Styling ---
+bear_color = input.color(color.new(color.red, 80), "Bearish FVG Color", group="Bearish FVG Style")
+bear_border_color = input.color(color.red, "Bearish Border Color", group="Bearish FVG Style")
+bear_border_style = input.string("Solid", "Bearish Border Style", options=["Solid", "Dashed", "Dotted"], group="Bearish FVG Style")
+
+// --- Alert Settings ---
+alert_on_touch = input.bool(true, "Alert on FVG Touch", group="Alerts")
+alert_on_fill = input.bool(true, "Alert on FVG Fill", group="Alerts")
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Convert border style string to Pine Script style
+get_border_style(style_str) =>
+    switch style_str
+        "Solid" => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+// Calculate FVG size based on user preference
+calculate_fvg_size(gap_high, gap_low, format_type) =>
+    gap_size = gap_high - gap_low
+    switch format_type
+        "Percentage" => (gap_size / gap_low) * 100
+        "Pips" => gap_size / syminfo.mintick / 10
+        "Points" => gap_size
+        => gap_size
+
+// Format FVG size for display
+format_fvg_size(size_value, format_type) =>
+    switch format_type
+        "Percentage" => str.tostring(size_value, "#.##") + "%"
+        "Pips" => str.tostring(size_value, "#.#") + " pips"
+        "Points" => str.tostring(size_value, "#.####") + " pts"
+        => str.tostring(size_value)
+
+// Check if FVG is touched by current price action
+is_fvg_touched(gap_high, gap_low, current_high, current_low) =>
+    (current_high >= gap_low and current_low <= gap_high)
+
+// Check if FVG is completely filled
+is_fvg_filled(gap_high, gap_low, current_high, current_low, is_bullish) =>
+    if is_bullish
+        current_low <= gap_low
+    else
+        current_high >= gap_high
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   FVG DETECTION LOGIC
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Function to detect FVGs (works for both current timeframe and MTF)
+detect_fvg(src_high, src_low, src_close, src_open) =>
+    // Standard 3-candle FVG detection
+    // Bullish FVG: current low > high[2] (gap between candles)
+    // Bearish FVG: current high < low[2] (gap between candles)
+    
+    bullish_fvg = bullish_enabled and src_low > src_high[2]
+    bearish_fvg = bearish_enabled and src_high < src_low[2]
+    
+    bull_gap_high = bullish_fvg ? src_low : na
+    bull_gap_low = bullish_fvg ? src_high[2] : na
+    bear_gap_high = bearish_fvg ? src_low[2] : na
+    bear_gap_low = bearish_fvg ? src_high : na
+    
+    [bullish_fvg, bearish_fvg, bull_gap_high, bull_gap_low, bear_gap_high, bear_gap_low]
+
+// Current timeframe FVG detection only
+[bull_fvg, bear_fvg, bull_high, bull_low, bear_high, bear_low] = detect_fvg(high, low, close, open)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   FVG MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// User-defined type for FVG data
+type FVG
+    box fvg_box
+    label fvg_label = na
+    float gap_high
+    float gap_low
+    bool is_bullish
+    bool is_filled
+    bool is_touched
+    int birth_bar
+
+// Arrays to store FVG objects
+var array<FVG> bullish_fvgs = array.new<FVG>()
+var array<FVG> bearish_fvgs = array.new<FVG>()
+
+// Function to create new FVG
+create_fvg(gap_high, gap_low, is_bullish_fvg, birth_bar_index) =>
+    // Determine colors and styles
+    box_color = is_bullish_fvg ? bull_color : bear_color
+    border_color = is_bullish_fvg ? bull_border_color : bear_border_color
+    border_style = is_bullish_fvg ? get_border_style(bull_border_style) : get_border_style(bear_border_style)
+    
+    // Create box for FVG zone
+    fvg_box = box.new(birth_bar_index, gap_high, bar_index + 20, gap_low, 
+                      bgcolor=box_color, 
+                      border_color=border_color, 
+                      border_style=border_style,
+                      border_width=1,
+                      extend=extend.right)
+    
+    // Create label if enabled
+    fvg_label = label(na)
+    if show_labels
+        gap_size = calculate_fvg_size(gap_high, gap_low, label_format)
+        label_text = format_fvg_size(gap_size, label_format)
+        label_y = is_bullish_fvg ? gap_high : gap_low
+        label_style = is_bullish_fvg ? label.style_label_down : label.style_label_up
+        label_color = is_bullish_fvg ? bull_border_color : bear_border_color
+        
+        fvg_label := label.new(birth_bar_index, label_y, 
+                               text=label_text, 
+                               style=label_style,
+                               color=label_color,
+                               textcolor=color.white,
+                               size=size.small)
+    
+    // Create FVG object
+    FVG.new(fvg_box, fvg_label, gap_high, gap_low, is_bullish_fvg, false, false, birth_bar_index)
+
+// Function to update existing FVGs
+update_fvgs() =>
+    // Update bullish FVGs
+    if array.size(bullish_fvgs) > 0
+        for i = array.size(bullish_fvgs) - 1 to 0
+            fvg = array.get(bullish_fvgs, i)
+            
+            // Check if touched
+            if not fvg.is_touched and is_fvg_touched(fvg.gap_high, fvg.gap_low, high, low)
+                fvg.is_touched := true
+                if alert_on_touch
+                    alert("Bullish FVG Touched at " + str.tostring(close), alert.freq_once_per_bar)
+            
+            // Check if filled
+            if not fvg.is_filled and is_fvg_filled(fvg.gap_high, fvg.gap_low, high, low, true)
+                fvg.is_filled := true
+                if alert_on_fill
+                    alert("Bullish FVG Filled at " + str.tostring(close), alert.freq_once_per_bar)
+                
+                // Remove if not keeping filled FVGs
+                if not keep_filled
+                    box.delete(fvg.fvg_box)
+                    if not na(fvg.fvg_label)
+                        label.delete(fvg.fvg_label)
+                    array.remove(bullish_fvgs, i)
+    
+    // Update bearish FVGs
+    if array.size(bearish_fvgs) > 0
+        for i = array.size(bearish_fvgs) - 1 to 0
+            fvg = array.get(bearish_fvgs, i)
+            
+            // Check if touched
+            if not fvg.is_touched and is_fvg_touched(fvg.gap_high, fvg.gap_low, high, low)
+                fvg.is_touched := true
+                if alert_on_touch
+                    alert("Bearish FVG Touched at " + str.tostring(close), alert.freq_once_per_bar)
+            
+            // Check if filled
+            if not fvg.is_filled and is_fvg_filled(fvg.gap_high, fvg.gap_low, high, low, false)
+                fvg.is_filled := true
+                if alert_on_fill
+                    alert("Bearish FVG Filled at " + str.tostring(close), alert.freq_once_per_bar)
+                
+                // Remove if not keeping filled FVGs
+                if not keep_filled
+                    box.delete(fvg.fvg_box)
+                    if not na(fvg.fvg_label)
+                        label.delete(fvg.fvg_label)
+                    array.remove(bearish_fvgs, i)
+
+// Function to manage maximum FVG count
+manage_max_fvgs() =>
+    // Remove oldest bullish FVGs if exceeding limit
+    while array.size(bullish_fvgs) > max_fvgs
+        oldest_fvg = array.shift(bullish_fvgs)
+        box.delete(oldest_fvg.fvg_box)
+        if not na(oldest_fvg.fvg_label)
+            label.delete(oldest_fvg.fvg_label)
+    
+    // Remove oldest bearish FVGs if exceeding limit
+    while array.size(bearish_fvgs) > max_fvgs
+        oldest_fvg = array.shift(bearish_fvgs)
+        box.delete(oldest_fvg.fvg_box)
+        if not na(oldest_fvg.fvg_label)
+            label.delete(oldest_fvg.fvg_label)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   MAIN EXECUTION
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Only process if within historical scanning range
+if bar_index >= (last_bar_index - historical_bars)
+    
+    // Create new bullish FVG
+    if bull_fvg and not na(bull_high) and not na(bull_low)
+        new_bull_fvg = create_fvg(bull_high, bull_low, true, bar_index)
+        array.push(bullish_fvgs, new_bull_fvg)
+    
+    // Create new bearish FVG
+    if bear_fvg and not na(bear_high) and not na(bear_low)
+        new_bear_fvg = create_fvg(bear_high, bear_low, false, bar_index)
+        array.push(bearish_fvgs, new_bear_fvg)
+    
+    // Update existing FVGs
+    update_fvgs()
+    
+    // Manage maximum FVG count
+    manage_max_fvgs()
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   ALERT CONDITIONS
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Alert conditions for new FVG formation
+alertcondition(bull_fvg, "New Bullish FVG", "New Bullish Fair Value Gap detected")
+alertcondition(bear_fvg, "New Bearish FVG", "New Bearish Fair Value Gap detected")
+
+// Combined alert for any new FVG
+alertcondition(bull_fvg or bear_fvg, "New FVG", "New Fair Value Gap detected")
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   PLOT INFORMATION
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Plot invisible values for information display
+plot(na, title="Bullish FVGs", color=bull_border_color, display=display.none)
+plot(na, title="Bearish FVGs", color=bear_border_color, display=display.none)
+
+// Display current FVG count in a table (optional - can be enabled/disabled via input)
+show_stats = input.bool(false, "Show Statistics Table", group="Display Settings")
+
+if show_stats and barstate.islast
+    var table stats_table = table.new(position.top_right, 2, 3, bgcolor=color.new(color.white, 90), border_width=1)
+    table.cell(stats_table, 0, 0, "FVG Stats", text_color=color.black, text_size=size.small)
+    table.cell(stats_table, 1, 0, "", text_color=color.black, text_size=size.small)
+    table.cell(stats_table, 0, 1, "Bullish", text_color=color.green, text_size=size.small)
+    table.cell(stats_table, 1, 1, str.tostring(array.size(bullish_fvgs)), text_color=color.black, text_size=size.small)
+    table.cell(stats_table, 0, 2, "Bearish", text_color=color.red, text_size=size.small)
+    table.cell(stats_table, 1, 2, str.tostring(array.size(bearish_fvgs)), text_color=color.black, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                                   END OF SCRIPT
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// USAGE NOTES:
+// 1. This indicator detects Fair Value Gaps using the standard 3-candle method
+// 2. Bullish FVG: Current candle's low > High of 2 candles ago
+// 3. Bearish FVG: Current candle's high < Low of 2 candles ago
+// 4. FVGs are automatically removed when filled (unless "Keep Filled FVGs" is enabled)
+// 6. Extensive customization options for colors, styles, and behavior
+// 7. Built-in alert system for FVG touch and fill events
+// 8. Performance optimized with historical bar scanning limits
